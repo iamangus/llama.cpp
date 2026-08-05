@@ -1235,6 +1235,11 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                         : (i11 * nb11 + i12 * nb12 + i13 * nb13));
                 float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
 
+                // software-prefetch weight rows far ahead to maximize MLP for the contiguous row run
+                if (iir0 + blck_0 * 64 < ir0_end) {
+                    __builtin_prefetch(src0_row + (iir0 + blck_0 * 64) * nb01, 0, 3);
+                }
+
                 //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
                 //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
                 //}
@@ -3099,6 +3104,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        static bool g_dbg = false, g_dbg_init = false;
+        static int64_t g_op_cnt = 0;
+        if (!g_dbg_init) { g_dbg = getenv("KTC_DEBUG_TIMING") != NULL; g_dbg_init = true; }
+        const int64_t t_node0 = (state->ith == 0 && g_dbg) ? ggml_time_us() : 0;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
@@ -3114,6 +3123,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+        // wall time incl. barrier - measured on thread 0 after all threads finished
+        if (state->ith == 0 && g_dbg && g_op_cnt < 2600) {
+            printf("OP %-48s %-12s %9.1f us\n", node->name, ggml_op_name(node->op), (double)(ggml_time_us() - t_node0)/1000.0);
+            g_op_cnt++;
         }
     }
 
