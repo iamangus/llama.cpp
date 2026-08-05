@@ -1241,7 +1241,13 @@ cleanup:
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
+#if defined(__GLIBC__) && (!defined(__GLIBC_PREREQ) || !__GLIBC_PREREQ(2, 29)) && !defined(__APPLE__)
+    /* glibc < 2.29 does not provide posix_spawn_file_actions_addchdir_np;
+       fall back to inheriting the parent working directory */
+    posix_error = 0;
+#else
     posix_error = posix_spawn_file_actions_addchdir_np(&actions, process_cwd);
+#endif
 #if defined(__APPLE__) && defined(__clang__)
 #pragma clang diagnostic pop
 #endif
