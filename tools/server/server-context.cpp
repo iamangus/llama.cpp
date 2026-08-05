@@ -947,6 +947,10 @@ private:
 
     llama_context * ctx_tgt = nullptr;
 
+    // custom CPU threadpools carrying the user-requested affinity (--cpu-mask/--cpu-range/--cpu-strict)
+    ggml_threadpool * tp_main  = nullptr;
+    ggml_threadpool * tp_batch = nullptr;
+
     server_batch batch;
 
     llama_model   * model_dft = nullptr;
@@ -1000,6 +1004,21 @@ private:
 
         llama_init.reset();
 
+        // release any threadpools we attached (must happen after the context is gone)
+        if (tp_main || tp_batch) {
+            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu_dev) {
+                auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
+                auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+                if (ggml_threadpool_free_fn) {
+                    if (tp_batch) ggml_threadpool_free_fn(tp_batch);
+                    if (tp_main)  ggml_threadpool_free_fn(tp_main);
+                }
+            }
+            tp_main  = nullptr;
+            tp_batch = nullptr;
+        }
+
         ctx_tgt = nullptr;
         model_tgt = nullptr;
 
@@ -1051,6 +1070,59 @@ private:
             });
         }
         return true;
+    }
+
+    void attach_cpu_threadpools() {
+        if (ctx_tgt == nullptr) {
+            return;
+        }
+
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!cpu_dev) {
+            SRV_ERR("%s", "no CPU backend found");
+            return;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
+        auto * ggml_threadpool_new_fn  = (decltype(ggml_threadpool_new)  *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+        auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+        if (!ggml_threadpool_new_fn || !ggml_threadpool_free_fn) {
+            SRV_ERR("%s", "could not resolve ggml CPU threadpool functions");
+            return;
+        }
+
+        // free any pools from a previous model load
+        if (tp_main || tp_batch) {
+            if (tp_batch) ggml_threadpool_free_fn(tp_batch);
+            if (tp_main)  ggml_threadpool_free_fn(tp_main);
+            tp_main  = nullptr;
+            tp_batch = nullptr;
+        }
+
+        struct ggml_threadpool_params tpp       = ggml_threadpool_params_from_cpu_params(params_base.cpuparams);
+        struct ggml_threadpool_params tpp_batch = ggml_threadpool_params_from_cpu_params(params_base.cpuparams_batch);
+
+        if (!ggml_threadpool_params_match(&tpp, &tpp_batch)) {
+            tp_batch = ggml_threadpool_new_fn(&tpp_batch);
+            if (!tp_batch) {
+                SRV_ERR("batch threadpool create failed : n_threads %d\n", tpp_batch.n_threads);
+                return;
+            }
+            // start the non-batch threadpool in the paused state
+            tpp.paused = true;
+        }
+
+        tp_main = ggml_threadpool_new_fn(&tpp);
+        if (!tp_main) {
+            SRV_ERR("threadpool create failed : n_threads %d\n", tpp.n_threads);
+            if (tp_batch) ggml_threadpool_free_fn(tp_batch);
+            tp_batch = nullptr;
+            return;
+        }
+
+        llama_detach_threadpool(ctx_tgt);
+        llama_attach_threadpool(ctx_tgt, tp_main, tp_batch);
+        SRV_INF("server_context_impl: attached CPU threadpools (main n_threads=%d, batch n_threads=%d)\n",
+                tpp.n_threads, tpp_batch.n_threads);
     }
 
     // load the model and initialize llama_context
@@ -1214,6 +1286,8 @@ private:
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
         }
+
+        attach_cpu_threadpools();
 
         vocab = llama_model_get_vocab(model_tgt);
 
